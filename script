@@ -1,21 +1,33 @@
 ###############################################################################
-# Generic mouse ORA pipeline                                                  #
-#  • Input : plain‑text file “genes.txt” (one ID per line)                    #
-#  • Output: dated folder with CSV tables ‑ every table contains **both**     #
-#            Entrez IDs *and* gene symbols; bar‑ and dot‑plots if ≥ 1 term    #
-#  • Libraries: GO‑BP, KEGG, Reactome, MSigDB Hallmark, MSigDB C7 Immunologic #
-#            + a focused check for interferon sets                            #
+#  generic_mouse_ORA.R                                                        #
+#                                                                             #
+#  A lightweight over‑representation workflow for mouse hit lists             #
+#  ------------------------------------------------------------------------   #
+#  • Reads a plain‑text file (one gene ID per line)                            #
+#  • Supports MGI symbols, Ensembl IDs, and Entrez IDs                        #
+#  • Converts to Entrez, with an optional manual‑map for awkward genes        #
+#  • Runs ORA against:                                                        #
+#       – GO:Biological Process                                               #
+#       – KEGG mouse pathways                                                 #
+#       – Reactome mouse pathways                                             #
+#       – MSigDB Hallmark (H)                                                 #
+#       – MSigDB C7 Immunologic                                               #
+#       – A focused interferon panel (2 Hallmarks + Reactome IFN pathway)     #
+#  • Writes a dated, numbered output folder with:                             #
+#       – CSV tables (Entrez **and** symbol lists)                            #
+#       – Bar & dot PNGs for every library with ≥ 1 significant term          #
 ###############################################################################
 
-################ user options #################################################
-input_file <- "genes.txt"           # one symbol/Ensembl/Entrez per line
-p_cut      <- 0.10                  # exploratory FDR cut‑off
+## ---------------- user settings ------------------------------------------
+input_file  <- "genes.txt"  # one ID per line
+p_cut       <- 0.10         # BH‑adjusted FDR threshold
+manual_ids  <- c(           # fallback symbol → Entrez map (edit as needed)
 )
-###############################################################################
+## ------------------------------------------------------------------------
 
 suppressPackageStartupMessages({
   if (!requireNamespace("BiocManager", quietly = TRUE))
-    install.packages("BiocManager")
+    install.packages("BiocManager", quiet = TRUE)
 
   BiocManager::install(
     c("clusterProfiler", "org.Mm.eg.db", "ReactomePA",
@@ -31,110 +43,110 @@ suppressPackageStartupMessages({
   library(tidyverse)
 })
 
-############### helpers #######################################################
-map_to_entrez <- function(ids, fallback = NULL, orgdb = org.Mm.eg.db) {
-  ens <- ids[grepl("^ENS", ids)]
-  sym <- ids[grepl("^[A-Za-z]", ids) & !ids %in% ens]
-  num <- ids[grepl("^[0-9]+$", ids)]
+# ---------- helper: ID conversion -------------------------------------------
+convert_to_entrez <- function(id_vec, extra = NULL, orgdb = org.Mm.eg.db) {
+  ens <- id_vec[grepl("^ENS",  id_vec)]
+  sym <- id_vec[grepl("^[A-Za-z]", id_vec) & !id_vec %in% ens]
 
-  map_sym <- bitr(sym, "SYMBOL",  "ENTREZID", OrgDb = orgdb)
-  map_ens <- bitr(ens, "ENSEMBL", "ENTREZID", OrgDb = orgdb)
+  tbl_sym <- bitr(sym, "SYMBOL",  "ENTREZID", OrgDb = orgdb)
+  tbl_ens <- bitr(ens, "ENSEMBL", "ENTREZID", OrgDb = orgdb)
+  tbl_man <- tibble(SYMBOL = names(extra), ENTREZID = unname(extra))
 
-  fb_df <- tibble(SYMBOL = names(fallback), ENTREZID = unname(fallback))
-
-  bind_rows(map_sym, map_ens, fb_df) %>%
+  bind_rows(tbl_sym, tbl_ens, tbl_man) %>%
     distinct(ENTREZID, .keep_all = TRUE) %>%
     pull(ENTREZID)
 }
 
-add_symbols <- function(res_obj, orgdb = org.Mm.eg.db) {
-  sym_obj <- setReadable(res_obj, OrgDb = orgdb, keyType = "ENTREZID")
-  left_join(as.data.frame(res_obj),
-            as.data.frame(sym_obj)[, c("ID", "geneID")],
+# ---------- helper: add symbols to result -----------------------------------
+add_symbols <- function(res, orgdb = org.Mm.eg.db) {
+  r_sym <- setReadable(res, OrgDb = orgdb, keyType = "ENTREZID")
+  left_join(as.data.frame(res),
+            as.data.frame(r_sym)[, c("ID", "geneID")],
             by = "ID",
             suffix = c("_Entrez", "_Symbol"))
 }
 
-write_results <- function(res, tag, out_dir, topN = 15) {
-  csv_path <- file.path(out_dir, paste0(tag, ".csv"))
-  write.csv(res, csv_path, row.names = FALSE)
+# ---------- helper: save CSV + bar/dot PNGs ----------------------------------
+write_res <- function(res, tag, out_dir, topN = 15) {
+  out_csv <- file.path(out_dir, paste0(tag, ".csv"))
+  write.csv(add_symbols(res), out_csv, row.names = FALSE)
 
-  if (nrow(res) == 0) return(invisible())
+  if (nrow(res@result) == 0) return(invisible())
 
-  plot_bar <- file.path(out_dir, paste0(tag, "_bar.png"))
-  plot_dot <- file.path(out_dir, paste0(tag, "_dot.png"))
-
-  png(plot_bar, 2000, 1300, res = 220)
-  barplot(res, showCategory = min(topN, nrow(res)))
-  dev.off()
-
-  png(plot_dot, 2000, 1300, res = 220)
-  dotplot(res, showCategory = min(topN, nrow(res)))
-  dev.off()
+  for (plt in c("bar", "dot")) {
+    png(file.path(out_dir, sprintf("%s_%s.png", tag, plt)),
+        2000, 1300, res = 220)
+    g <- switch(plt,
+                bar = barplot(res, showCategory = min(topN, nrow(res@result))),
+                dot = dotplot(res, showCategory = min(topN, nrow(res@result))))
+    print(g)
+    dev.off()
+  }
 }
 
-################ 1.  read genes ###############################################
+# ---------------- read gene list ---------------------------------------------
 if (!file.exists(input_file))
-  stop("Cannot find ", input_file)
+  stop("file not found: ", input_file)
 
-genes <- readLines(input_file) %>% trimws() %>% discard(~ .x == "")
-genes[grepl("^steroid sulfatase", tolower(genes))] <- "Sts"  # example tidy‑up
-genes <- unique(genes)
+hit_genes <- readLines(input_file) %>%
+             trimws() %>%
+             discard(~ .x == "")
 
-################ 2.  map IDs ##################################################
-entrez <- map_to_entrez(genes, manual_ids)
-cat("Mapped", length(entrez), "of", length(genes), "genes\n")
+# example tidy‑up: convert verbose sulfatase description to 'Sts'
+hit_genes[grepl("^steroid sulfatase", tolower(hit_genes))] <- "Sts"
+hit_genes <- unique(hit_genes)
 
-################ 3.  enrichment ###############################################
-ego_bp <- enrichGO(entrez, OrgDb = org.Mm.eg.db, ont = "BP",
+entrez_hits <- convert_to_entrez(hit_genes, manual_ids)
+cat("Mapped", length(entrez_hits), "of", length(hit_genes), "genes\n")
+
+# ---------------- enrichment --------------------------------------------------
+ego_bp <- enrichGO(entrez_hits, OrgDb = org.Mm.eg.db, ont = "BP",
                    keyType = "ENTREZID", pvalueCutoff = p_cut, qvalueCutoff = p_cut)
 
-ekegg  <- enrichKEGG(entrez, organism = "mmu", pvalueCutoff = p_cut)
+ekegg  <- enrichKEGG(entrez_hits, organism = "mmu", pvalueCutoff = p_cut)
+ereact <- enrichPathway(entrez_hits, organism = "mouse", pvalueCutoff = p_cut)
 
-ereact <- enrichPathway(entrez, organism = "mouse", pvalueCutoff = p_cut)
+msig_H <- msigdbr("Mus musculus", category = "H")
+msig_C7<- msigdbr("Mus musculus", category = "C7")
 
-msig_h  <- msigdbr("Mus musculus", category = "H")
-msig_c7 <- msigdbr("Mus musculus", category = "C7")
-
-ehall <- enricher(entrez, TERM2GENE = msig_h  %>% select(gs_name, entrez_gene),
+ehall <- enricher(entrez_hits,
+                  TERM2GENE = msig_H %>% select(gs_name, entrez_gene),
                   pvalueCutoff = p_cut)
-eC7   <- enricher(entrez, TERM2GENE = msig_c7 %>% select(gs_name, entrez_gene),
+eC7   <- enricher(entrez_hits,
+                  TERM2GENE = msig_C7 %>% select(gs_name, entrez_gene),
                   pvalueCutoff = p_cut)
 
-## focused interferon sets
-ifn_h <- msig_h %>% filter(gs_name %in% c("HALLMARK_INTERFERON_ALPHA_RESPONSE",
-                                          "HALLMARK_INTERFERON_GAMMA_RESPONSE"))
-ifn_r <- msigdbr("Mus musculus", category = "C2",
-                 subcategory = "CP:REACTOME") %>%
+# focused IFN sets
+ifn_H <- msig_H %>%
+         filter(gs_name %in% c("HALLMARK_INTERFERON_ALPHA_RESPONSE",
+                               "HALLMARK_INTERFERON_GAMMA_RESPONSE"))
+ifn_R <- msigdbr("Mus musculus", category = "C2", subcategory = "CP:REACTOME") %>%
          filter(gs_name == "REACTOME_INTERFERON_SIGNALING")
 
-e_ifn_h <- enricher(entrez, TERM2GENE = ifn_h %>% select(gs_name, entrez_gene),
-                    pvalueCutoff = p_cut)
-e_ifn_r <- enricher(entrez, TERM2GENE = ifn_r %>% select(gs_name, entrez_gene),
-                    pvalueCutoff = p_cut)
+e_ifnH <- enricher(entrez_hits,
+                   TERM2GENE = ifn_H %>% select(gs_name, entrez_gene),
+                   pvalueCutoff = p_cut)
+e_ifnR <- enricher(entrez_hits,
+                   TERM2GENE = ifn_R %>% select(gs_name, entrez_gene),
+                   pvalueCutoff = p_cut)
 
-################ 4.  output folder ############################################
-d <- format(Sys.Date(), "%Y-%m-%d")
-n <- 1
+# ---------------- output directory -------------------------------------------
+today  <- format(Sys.Date(), "%Y-%m-%d")
+index  <- 1
 repeat {
-  out_dir <- sprintf("ORA_%s_%03d", d, n)
+  out_dir <- sprintf("ORA_%s_%03d", today, index)
   if (!dir.exists(out_dir)) break
-  n <- n + 1
+  index <- index + 1
 }
 dir.create(out_dir)
 
-################ 5.  save everything ##########################################
-for (x in list(GO_BP      = ego_bp,
-               KEGG       = ekegg,
-               Reactome   = ereact,
-               Hallmark   = ehall,
-               C7_Immune  = eC7,
-               IFN_Hall   = e_ifn_h,
-               IFN_React  = e_ifn_r)) {
+# ---------------- save everything --------------------------------------------
+write_res(ego_bp,  "GO_BP",       out_dir)
+write_res(ekegg,   "KEGG",        out_dir)
+write_res(ereact,  "Reactome",    out_dir)
+write_res(ehall,   "Hallmark",    out_dir)
+write_res(eC7,     "C7_Immune",   out_dir)
+write_res(e_ifnH,  "IFN_Hallmark",out_dir)
+write_res(e_ifnR,  "IFN_Reactome",out_dir)
 
-  tag <- names(x)
-  res_df <- add_symbols(x[[1]])
-  write_results(res_df, tag, out_dir)
-}
-
-cat("Finished.  Files written to", out_dir, "\n")
+cat("✓  ORA completed — results in", out_dir, "\n")
